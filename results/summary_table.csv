@@ -1,0 +1,5 @@
+Strategy,Total Cost ($),Mean Cost/h ($),Saving ($),Saving (%)
+Always Idle,3.8293,0.1596,0.0000,+0.0%
+Always Charge,4.9811,0.2075,-1.1517,-30.1%
+Rule-Based,3.4950,0.1456,0.3343,+8.7%
+PPO (Ours),3.2957,0.1373,0.5336,+13.9%

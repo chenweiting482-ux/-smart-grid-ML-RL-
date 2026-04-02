@@ -1,0 +1,22 @@
+============================================================
+  PPO Training Report v5 — Microgrid EMS
+============================================================
+
+[Key Design Choices]
+  Action: DISCRETE {0=discharge, 1=idle, 2=charge}
+  Episode: 24 hours (1 day) — fast credit assignment
+  Reward: base(-cost) + shaping(charge/discharge bonuses)
+  State: 6-dim [load, solar, price, soc, hour, net_load]
+
+[Reward Shaping]
+  +0.3 * stored/cap  when charging at off-peak ($0.10)
+  +0.2 * stored/cap  when charging with solar surplus
+  +0.3 * discharged  when discharging at peak ($0.40)
+  -0.1               when SoC<0.5 at peak (missed chance)
+  -0.2               when charging at peak (wasteful)
+
+[Results]
+  Best eval reward:  2.49  (step 115,000)
+  Final eval reward: 1.37
+  Best model:        saved_models/best_model.zip
+============================================================
