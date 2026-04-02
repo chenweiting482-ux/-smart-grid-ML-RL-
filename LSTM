@@ -1,0 +1,238 @@
+"""
+ML_LSTM.py  v6
+══════════════
+Dual-output LSTM: predict load AND solar generation.
+
+Price model (corrected, economically realistic):
+  Night   00-05  $0.10   ← cheapest: charge here
+  Day     06-17  $0.20   ← medium: use solar
+  Evening 18-23  $0.40   ← peak: discharge here
+
+Solar model:
+  Zero at night, peaks at solar noon (~13:00), Gaussian noise.
+"""
+
+import numpy as np
+import pandas as pd
+import pickle, os
+import matplotlib
+import matplotlib.pyplot as plt
+matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+DATA_PATH = r"D:\OneDrive - Yokogawa Electric Corporation\Desktop\Smart grid 2\household_power_consumption.csv"
+
+# ── global config ──────────────────────────────────────────────
+FEATURE_COLS = ["load_lag1", "load_lag24", "load_lag168",
+                "hour_of_day", "day_of_week"]
+TARGET_COLS  = ["load", "solar"]
+SEQ_LEN      = 24
+SOLAR_CAP    = 3.0   # kW peak
+
+
+# ── price model (economically correct) ─────────────────────────
+def price_model(hour: int) -> float:
+    """
+    Realistic 3-tier Time-of-Use tariff:
+      00-05  night  → $0.10  cheapest  (charge battery here)
+      06-17  day    → $0.20  medium    (use solar, idle battery)
+      18-23  evening→ $0.40  peak      (discharge battery here)
+
+    Rule-Based optimal strategy:
+      night  → charge
+      evening→ discharge
+      day    → idle (use solar to cover load)
+    """
+    if   hour < 6:  return 0.10   # night off-peak
+    elif hour < 18: return 0.20   # day shoulder
+    else:           return 0.40   # evening peak
+
+
+PRICE_MIN = 0.10
+PRICE_MAX = 0.40
+PRICE_SELL = 0.05   # sell-back rate
+
+
+# ── solar model ────────────────────────────────────────────────
+def generate_solar(hour: int, noise: bool = True) -> float:
+    """
+    Synthetic PV: zero at night, peaks ~13:00 (solar noon).
+    Uses a shifted sine so peak aligns with actual sun position.
+    """
+    if hour < 6 or hour > 20:
+        return 0.0
+    peak   = np.sin((hour - 6) / 14 * np.pi)
+    output = max(0.0, peak) * SOLAR_CAP
+    if noise:
+        output = max(0.0, output + np.random.normal(0, 0.1 * SOLAR_CAP))
+    return float(output)
+
+
+# ── data loading ───────────────────────────────────────────────
+def load_uci_data(filepath):
+    print("Loading UCI dataset...")
+    df = pd.read_csv(filepath, low_memory=False, na_values=["?"])
+    df["datetime"] = pd.to_datetime(
+        df["Date"] + " " + df["Time"], dayfirst=True, format="mixed")
+    df = df[["datetime", "Global_active_power"]].copy()
+    df.columns = ["datetime", "load"]
+    df["load"] = pd.to_numeric(df["load"], errors="coerce")
+    df = df.set_index("datetime").resample("1h").mean().dropna()
+    print(f"  Total hours: {len(df)}")
+    print(f"  Date range:  {df.index.min()} → {df.index.max()}")
+    return df
+
+
+def add_features(df):
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df["hour_of_day"] = df.index.hour
+    df["day_of_week"]  = df.index.dayofweek
+    df["load_lag1"]    = df["load"].shift(1)
+    df["load_lag24"]   = df["load"].shift(24)
+    df["load_lag168"]  = df["load"].shift(168)
+    # solar target (deterministic, no noise for training target)
+    df["solar"] = df.index.hour.map(lambda h: generate_solar(h, noise=False))
+    return df.dropna()
+
+
+# ── dataset ────────────────────────────────────────────────────
+class LoadDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+    def __len__(self):        return len(self.y)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+
+def build_sequences(df, X_scaler=None, y_scaler=None, fit=True):
+    if fit:
+        X_scaler = MinMaxScaler()
+        y_scaler = MinMaxScaler()
+        features = X_scaler.fit_transform(df[FEATURE_COLS].values)
+        targets  = y_scaler.fit_transform(df[TARGET_COLS].values)
+    else:
+        features = X_scaler.transform(df[FEATURE_COLS].values)
+        targets  = y_scaler.transform(df[TARGET_COLS].values)
+    X_seq, y_seq = [], []
+    for i in range(SEQ_LEN, len(features)):
+        X_seq.append(features[i - SEQ_LEN : i])
+        y_seq.append(targets[i])
+    return np.array(X_seq), np.array(y_seq), X_scaler, y_scaler
+
+
+# ── LSTM model ─────────────────────────────────────────────────
+class LSTMForecaster(nn.Module):
+    def __init__(self, input_size=5, hidden_size=64,
+                 num_layers=2, dropout=0.2, output_size=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout)
+        self.fc   = nn.Linear(hidden_size, output_size)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+
+# ── training ───────────────────────────────────────────────────
+def train(filepath=DATA_PATH, epochs=30, batch_size=64, lr=1e-3):
+    df    = load_uci_data(filepath)
+    df    = add_features(df)
+    split = int(len(df) * 0.8)
+
+    train_df = df.iloc[:split]
+    test_df  = df.iloc[split:]
+
+    X_train, y_train, X_sc, y_sc = build_sequences(train_df, fit=True)
+    X_test,  y_test,  _,    _    = build_sequences(test_df, X_sc, y_sc, fit=False)
+
+    train_loader = DataLoader(LoadDataset(X_train, y_train),
+                              batch_size=batch_size, shuffle=True)
+    test_loader  = DataLoader(LoadDataset(X_test,  y_test),
+                              batch_size=batch_size)
+
+    print(f"\nTrain: {len(X_train)} | Test: {len(X_test)}")
+    print(f"Input: {len(FEATURE_COLS)} features × {SEQ_LEN} steps")
+    print(f"Output: {TARGET_COLS}\n")
+
+    os.makedirs("saved_models", exist_ok=True)
+    os.makedirs("results",      exist_ok=True)
+
+    model     = LSTMForecaster(input_size=len(FEATURE_COLS),
+                               output_size=len(TARGET_COLS))
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    best_mae = float("inf")
+    train_losses, load_maes, solar_maes = [], [], []
+
+    print("Training LSTM...")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        eloss = 0
+        for xb, yb in train_loader:
+            pred = model(xb); loss = criterion(pred, yb)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            eloss += loss.item() * len(xb)
+        eloss /= len(train_loader.dataset)
+        train_losses.append(eloss)
+
+        model.eval()
+        ps, ts = [], []
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                ps.append(model(xb).numpy()); ts.append(yb.numpy())
+        pr = y_sc.inverse_transform(np.concatenate(ps))
+        tr = y_sc.inverse_transform(np.concatenate(ts))
+
+        lmae  = mean_absolute_error(tr[:,0], pr[:,0])
+        smae  = mean_absolute_error(tr[:,1], pr[:,1])
+        load_maes.append(lmae); solar_maes.append(smae)
+
+        if lmae + smae < best_mae:
+            best_mae = lmae + smae
+            torch.save(model.state_dict(), "saved_models/lstm_best.pth")
+
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:3d}/{epochs} | Loss:{eloss:.5f} | "
+                  f"Load MAE:{lmae:.4f} kW | Solar MAE:{smae:.4f} kW")
+
+    torch.save(model.state_dict(), "saved_models/lstm_model.pth")
+    with open("saved_models/scalers.pkl", "wb") as f:
+        pickle.dump({"X_scaler": X_sc, "y_scaler": y_sc}, f)
+    test_df.to_csv("saved_models/test_data.csv")
+    print("\nSaved: lstm_best.pth / scalers.pkl / test_data.csv")
+
+    # plots
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4))
+    ax[0].plot(train_losses, color="#2ca02c"); ax[0].set_title("Loss"); ax[0].grid(0.3)
+    ax[1].plot(load_maes,  color="#1f77b4"); ax[1].set_title("Load MAE (kW)"); ax[1].grid(0.3)
+    ax[2].plot(solar_maes, color="#e07b39"); ax[2].set_title("Solar MAE (kW)"); ax[2].grid(0.3)
+    for a in ax: a.set_xlabel("Epoch")
+    fig.suptitle("LSTM Training Curves", fontsize=12); fig.tight_layout()
+    fig.savefig("results/lstm_training_curve.png", dpi=150, bbox_inches="tight")
+
+    fig2, (a1, a2) = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+    a1.plot(tr[:168,0], color="#1f77b4", lw=1.2, label="Actual")
+    a1.plot(pr[:168,0], color="#e07b39", lw=1.2, ls="--", label="Predicted")
+    a1.set_ylabel("Load (kW)"); a1.legend(); a1.grid(0.3)
+    a1.set_title("LSTM Prediction vs Actual — first 168h of test set")
+    a2.plot(tr[:168,1], color="#1f77b4", lw=1.2, label="Actual")
+    a2.plot(pr[:168,1], color="#e07b39", lw=1.2, ls="--", label="Predicted")
+    a2.set_ylabel("Solar (kW)"); a2.set_xlabel("Hour"); a2.legend(); a2.grid(0.3)
+    fig2.tight_layout()
+    fig2.savefig("results/lstm_prediction.png", dpi=150, bbox_inches="tight")
+    print("Saved: results/lstm_training_curve.png / lstm_prediction.png")
+    plt.show()
+    print("\nDone! Next: python rl_environment.py")
+    return model, X_sc, y_sc
+
+
+if __name__ == "__main__":
+    train()
